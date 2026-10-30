@@ -29,15 +29,44 @@ const active = (start, end, m) => start <= m && (!end || m <= end);
 const incomeForMonth = (i, m) => i.recurring ? active(i.startMonth, i.endMonth, m) : monthOf(i.date) === m;
 const fixedForMonth = (f, m) => active(f.startMonth, f.endMonth, m);
 const sum = (a, value) => a.reduce((v, x) => v + value(x), 0);
-function newData() { return { version: 1, setup: false, percent: 20, percentVersions: [], incomes: [], fixed: [], expenses: [], goals: [], movements: [], created: isoLocal(now()) }; }
+function newData() { return { version: 1, setup: false, percent: 20, percentVersions: [], incomes: [], fixed: [], expenses: [], goals: [], movements: [], installments: [], created: isoLocal(now()) }; }
 function selectedIncomes(d, m) { return d.incomes.filter(x => incomeForMonth(x, m)); }
 function selectedFixed(d, m) { return d.fixed.filter(x => fixedForMonth(x, m)); }
 function selectedExpenses(d, m) { return d.expenses.filter(x => monthOf(x.date) === m); }
+function selectedInstallments(d, m) { return (d.installments || []).flatMap(plan => plan.installments.filter(part => part.month === m).map(part => ({ plan, part }))); }
+function installmentTotal(plan) { return sum(plan.installments, p => p.amount); }
+function newInstallmentParts(total, count, firstMonth, description, category, dueDay) {
+    if (!Number.isSafeInteger(total) || total <= 0 || !Number.isInteger(count) || count < 1 || count > 360 || total < count)
+        throw new Error('Valor e parcelas inválidos. Cada parcela precisa ter pelo menos R$ 0,01 (máximo de 360).');
+    const base = Math.floor(total / count), remainder = total % count;
+    return Array.from({ length: count }, (_, i) => ({ id: uid(), month: addMonth(firstMonth, i), amount: base + (i < remainder ? 1 : 0), paid: false, description, category, dueDay }));
+}
+function dueDateFor(month, day) { const [y, mo] = month.split('-').map(Number); return isoLocal(new Date(y, mo - 1, Math.min(day, new Date(y, mo, 0).getDate()))); }
+function settleInstallment(d, planId, m) {
+    const plan = (d.installments || []).find(p => p.id === planId);
+    if (!plan)
+        throw new Error('Parcelamento não encontrado.');
+    if (m < currentMonth())
+        throw new Error('A quitação deve ser registrada no mês atual ou futuro.');
+    const future = plan.installments.filter(p => p.month >= m);
+    if (!future.length)
+        throw new Error('Não existem parcelas futuras para quitar.');
+    if (future.some(p => p.paid && p.month > m))
+        throw new Error('Existem parcelas futuras marcadas como pagas. Revise esses pagamentos antes de quitar.');
+    const unpaid = future.filter(p => !p.paid);
+    if (!unpaid.length)
+        throw new Error('Todas essas parcelas já estão pagas.');
+    const amount = sum(unpaid, p => p.amount);
+    const base = unpaid.find(p => p.month === m);
+    const payoff = { ...(base || unpaid[0]), id: uid(), month: m, amount, paid: true, paidAt: isoLocal(now()), kind: 'payoff' };
+    plan.installments = plan.installments.filter(p => p.month < m || (p.month === m && p.paid)).concat(payoff).sort((a, b) => a.month.localeCompare(b.month));
+    return amount;
+}
 function selectedMovements(d, m) { return d.movements.filter(x => monthOf(x.date) === m); }
 function effectivePercent(d, m) { const candidates = (d.percentVersions || []).filter(x => x.startMonth <= m).sort((a, b) => b.startMonth.localeCompare(a.startMonth)); return candidates.length ? candidates[0].percent : d.percent; }
 function calc(d, m) {
     const income = sum(selectedIncomes(d, m), x => x.amount);
-    const fixed = sum(selectedFixed(d, m), x => x.amount);
+    const fixed = sum(selectedFixed(d, m), x => x.amount) + sum(selectedInstallments(d, m), x => x.part.amount);
     const variable = sum(selectedExpenses(d, m), x => x.amount);
     const expenses = fixed + variable;
     const target = Math.round(income * effectivePercent(d, m) / 100);
@@ -45,7 +74,8 @@ function calc(d, m) {
     return { income, fixed, variable, expenses, balance: income - expenses, target, afterTarget: income - expenses - target, saved, availableToSpend: income - target, committed: income ? expenses / income * 100 : 0, savingProgress: target ? Math.max(0, Math.min(100, saved / target * 100)) : (saved > 0 ? 100 : 0) };
 }
 function breakdown(d, m) { const items = {}; for (const f of selectedFixed(d, m))
-    items[f.category] = (items[f.category] || 0) + f.amount; for (const e of selectedExpenses(d, m))
+    items[f.category] = (items[f.category] || 0) + f.amount; for (const i of selectedInstallments(d, m))
+    items[i.part.category] = (items[i.part.category] || 0) + i.part.amount; for (const e of selectedExpenses(d, m))
     items[e.category] = (items[e.category] || 0) + e.amount; return Object.entries(items).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value); }
 function goalBalance(d, goalId) { let balance = goalId === null ? 0 : (d.goals.find(g => g.id === goalId)?.initial || 0); for (const x of d.movements) {
     if (x.kind === 'deposit' && x.toGoal === goalId)
@@ -84,6 +114,17 @@ function alerts(d, m) {
         }
     }
     if (m === currentMonth())
+        for (const { part } of selectedInstallments(d, m)) {
+            if (part.paid)
+                continue;
+            const due = dueDateFor(m, part.dueDay);
+            const days = Math.round((new Date(`${due}T12:00:00`).getTime() - new Date(`${isoLocal(now())}T12:00:00`).getTime()) / 86400000);
+            if (days >= 0 && days <= 5)
+                a.push({ level: 'info', message: `Parcela de ${part.description} vence em ${days === 0 ? 'hoje' : `${days} dia(s)`}: ${money(part.amount)}.` });
+            else if (days < 0)
+                a.push({ level: 'danger', message: `Parcela de ${part.description} está ${-days} dia(s) além do vencimento.` });
+        }
+    if (m === currentMonth())
         for (const f of selectedFixed(d, m)) {
             if (f.paidMonths.includes(m))
                 continue;
@@ -106,6 +147,10 @@ function validateData(x) {
         throw new Error('Formato de backup ou percentual inválido.');
     if (x.percentVersions !== undefined && (!Array.isArray(x.percentVersions) || x.percentVersions.length > 5000 || x.percentVersions.some((v) => typeof v?.startMonth !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(v.startMonth) || !Number.isInteger(v.percent) || v.percent < 0 || v.percent > 100)))
         throw new Error('Histórico de percentuais inválido.');
+    if (x.installments !== undefined) {
+        if (!Array.isArray(x.installments) || x.installments.length > 5000)
+            throw new Error('Lista de parcelamentos inválida.');
+    }
     const names = ['incomes', 'fixed', 'expenses', 'goals', 'movements'];
     for (const n of names)
         if (!Array.isArray(x[n]) || x[n].length > 50000)
@@ -138,6 +183,31 @@ function validateData(x) {
         for (let i = 1; i < arr.length; i++)
             if (arr[i].start <= arr[i - 1].end)
                 throw new Error('Despesas recorrentes sobrepostas no backup.');
+    }
+    for (const plan of (x.installments || [])) {
+        idValid(plan);
+        if (!nameValid(plan.description) || !nameValid(plan.category) || !Number.isInteger(plan.dueDay) || plan.dueDay < 1 || plan.dueDay > 31 || !Array.isArray(plan.installments) || plan.installments.length < 1 || plan.installments.length > 360)
+            throw new Error('Parcelamento inválido no backup.');
+        let lastMonth = '0000-00', countInMonth = 0, foundPayoff = false;
+        for (const part of plan.installments) {
+            idValid(part);
+            if (!monthValid(part.month) || !Number.isSafeInteger(part.amount) || part.amount <= 0 || part.amount > 1e12 || typeof part.paid !== 'boolean' || !nameValid(part.description) || !nameValid(part.category) || !Number.isInteger(part.dueDay) || part.dueDay < 1 || part.dueDay > 31 || part.paidAt !== undefined && !dateValid(part.paidAt) || part.kind !== undefined && part.kind !== 'payoff' || part.kind === 'payoff' && !part.paid)
+                throw new Error('Parcela inválida no backup.');
+            if (part.month < lastMonth)
+                throw new Error('Parcela fora de ordem no backup.');
+            if (part.month === lastMonth) {
+                countInMonth++;
+                if (countInMonth > 2)
+                    throw new Error('Parcelas repetidas no mês.');
+            }
+            else
+                countInMonth = 1;
+            if (foundPayoff)
+                throw new Error('Existem parcelas após uma quitação.');
+            if (part.kind === 'payoff')
+                foundPayoff = true;
+            lastMonth = part.month;
+        }
     }
     for (const a of x.expenses) {
         idValid(a);
@@ -620,7 +690,7 @@ let setupFixed = [];
 let sidebarOpen = false;
 let busy = false;
 let viewArchived = false;
-const navItems = [['dashboard', 'Visão geral', 'layout-dashboard'], ['receitas', 'Minhas Receitas', 'wallet'], ['fixas', 'Despesas Fixas', 'calendar-clock'], ['gastos', 'Meus Gastos', 'credit-card'], ['economia', 'Economia Mensal', 'piggy-bank'], ['metas', 'Minhas Metas', 'target'], ['planejamento', 'Planejamento', 'calendar-days'], ['relatorios', 'Relatórios', 'chart-no-axes-combined'], ['configuracoes', 'Configurações', 'settings']];
+const navItems = [['dashboard', 'Visão geral', 'layout-dashboard'], ['receitas', 'Minhas Receitas', 'wallet'], ['fixas', 'Despesas Fixas', 'calendar-clock'], ['parcelamentos', 'Parcelamentos', 'layers'], ['gastos', 'Meus Gastos', 'credit-card'], ['economia', 'Economia Mensal', 'piggy-bank'], ['metas', 'Minhas Metas', 'target'], ['planejamento', 'Planejamento', 'calendar-days'], ['relatorios', 'Relatórios', 'chart-no-axes-combined'], ['configuracoes', 'Configurações', 'settings']];
 const ICONS = {
     'layout-dashboard': '<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
     wallet: '<path d="M20 7V5a2 2 0 0 0-2-2H5a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h15a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H5a3 3 0 0 1 0-6"/><path d="M17 14h.01"/>',
@@ -631,7 +701,7 @@ const ICONS = {
     'calendar-days': '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M8 2v4M16 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>',
     'chart-no-axes-combined': '<path d="M3 3v18h18M7 16l4-5 3 2 5-7"/><path d="M17 6h2v2"/>',
     settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l-1.8 1.8a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.5h-2.6V20a1.7 1.7 0 0 0-1.2-1.6 1.7 1.7 0 0 0-1.9.3l-1.8-1.8a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H5v-2.6h.5A1.7 1.7 0 0 0 7 10.2a1.7 1.7 0 0 0-.3-1.9l1.8-1.8a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V4h2.6v1.2A1.7 1.7 0 0 0 15 6.8a1.7 1.7 0 0 0 1.9-.3l1.8 1.8a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.5v2.6H20a1.7 1.7 0 0 0-.6 1.2Z"/>',
-    plus: '<path d="M12 5v14M5 12h14"/>', chevron: '<path d="m9 18 6-6-6-6"/>', chevronleft: '<path d="m15 18-6-6 6-6"/>', download: '<path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4"/>', upload: '<path d="M12 16V4m-5 5 5-5 5 5M4 16v4h16v-4"/>',
+    layers: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M8 2h8M8 22h8M7 10h10M7 14h6"/>', plus: '<path d="M12 5v14M5 12h14"/>', chevron: '<path d="m9 18 6-6-6-6"/>', chevronleft: '<path d="m15 18-6-6 6-6"/>', download: '<path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4"/>', upload: '<path d="M12 16V4m-5 5 5-5 5 5M4 16v4h16v-4"/>',
     trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 11v6M14 11v6"/>', edit: '<path d="m16 4 4 4-11 11-5 1 1-5L16 4ZM14 6l4 4"/>', check: '<path d="m4 12 5 5L20 6"/>', close: '<path d="M18 6 6 18M6 6l12 12"/>', bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/>', shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>', sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>', moon: '<path d="M20 15a8 8 0 1 1-11-11 8 8 0 0 0 11 11Z"/>', menu: '<path d="M4 6h16M4 12h16M4 18h16"/>', arrowup: '<path d="m12 19 0-14m-6 6 6-6 6 6"/>', arrowdown: '<path d="m12 5 0 14m-6-6 6 6 6-6"/>', repeat: '<path d="m17 2 4 4-4 4M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4M21 13v2a3 3 0 0 1-3 3H3"/>', info: '<circle cx="12" cy="12" r="10"/><path d="M12 11v5M12 7h.01"/>', trend: '<path d="m3 17 7-7 4 4 7-7m-5 0h5v5"/>', file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h8"/>', lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>', coins: '<circle cx="9" cy="8" r="5"/><path d="M16 9a5 5 0 1 1-7 7"/>', sparkles: '<path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3ZM19 18l.7 1.3L21 20l-1.3.7L19 22l-.7-1.3L17 20l1.3-.7L19 18Z"/>', empty: '<rect x="3" y="5" width="18" height="15" rx="3"/><path d="M7 11h10M7 15h6"/>'
 };
 function ic(name, size = 19) { return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.info}</svg>`; }
@@ -650,23 +720,43 @@ function lineChart(d, m, field) { const h = financeHistory(d, m, 12); const valu
 function alertsHtml(a) { if (!a.length)
     return `<div class="alert-item success">${ic('check')}<span>Nenhum alerta para os registros deste mês.</span></div>`; return a.map(x => `<div class="alert-item ${x.level}">${ic(x.level === 'danger' ? 'info' : x.level === 'success' ? 'check' : 'bell')}<span>${escapeHtml(x.message)}</span></div>`).join(''); }
 function dashboard() {
-    const m = calc(data, month), cat = breakdown(data, month), warning = alerts(data, month), up = selectedFixed(data, month).filter(x => !x.paidMonths.includes(month)).sort((a, b) => a.dueDay - b.dueDay).slice(0, 4);
+    const m = calc(data, month), cat = breakdown(data, month), warning = alerts(data, month), up = [...selectedFixed(data, month).filter(x => !x.paidMonths.includes(month)).map(f => ({ description: f.description, dueDay: f.dueDay, amount: f.amount })), ...selectedInstallments(data, month).filter(x => !x.part.paid).map(x => ({ description: x.part.description + ' (parcela)', dueDay: x.part.dueDay, amount: x.part.amount }))].sort((a, b) => a.dueDay - b.dueDay).slice(0, 4);
     return `<div class="hero"><div><div class="hero-eyebrow">SEU RESUMO FINANCEIRO</div><h2>Seu dinheiro, sob controle.</h2><p>Acompanhe suas decisões e mantenha seus objetivos à vista.</p></div><button class="btn white" data-action="open" data-kind="expense">${ic('plus', 17)} Registrar gasto</button><div class="hero-art">${ic('trend', 88)}</div></div>
  <div class="kpi-grid">${kpi('wallet', 'Receitas do mês', m.income, 'Fontes de renda', 'blue')}${kpi('calendar-clock', 'Despesas fixas', m.fixed, 'Contas recorrentes', 'violet')}${kpi('credit-card', 'Despesas variáveis', m.variable, 'Gastos pontuais', 'orange')}${kpi('arrowdown', 'Total de despesas', m.expenses, 'Fixas + variáveis', 'rose')}${kpi('target', 'Meta de economia', m.target, `${effectivePercent(data, month)}% da receita`, 'teal')}${kpi('coins', 'Saldo disponível', m.balance, 'Receitas menos despesas', 'blue')}${kpi('piggy-bank', 'Livre após a meta', m.afterTarget, 'Sem deduzir depósitos reais', 'green')}</div>
  <div class="commitment-banner"><div><span>RENDA COMPROMETIDA</span><strong>${percent(m.committed)}</strong><small>${money(m.expenses)} de ${money(m.income)} em despesas</small></div><div class="commitment-meter"><div style="width:${Math.min(100, m.committed)}%;background:${m.committed >= 100 ? '#ef596b' : m.committed >= 80 ? '#edac41' : '#22b6a2'}"></div></div><span class="commitment-info">${m.income === 0 ? 'Cadastre receitas para calcular o percentual' : m.committed > 100 ? 'As despesas superaram a renda' : m.committed >= 80 ? 'Atenção: orçamento pressionado' : 'Acompanhe o limite mensal'}</span></div>
  <div class="two-cols wide-left">${panel(`<div class="panel-title"><div><h3>Distribuição dos gastos</h3><p>Quanto cada categoria representa no mês</p></div>${ic('chart-no-axes-combined')}</div>${donut(cat)}`)}${panel(`<div class="panel-title"><div><h3>Sua economia mensal</h3><p>Depósitos líquidos registrados</p></div>${ic('piggy-bank')}</div><div class="saving-main">${money(m.saved)} <small>de ${money(m.target)}</small></div>${progress(m.saved, m.target)}<div class="saving-foot"><span>${percent(m.target ? m.saved / m.target * 100 : 0)} da meta</span><strong>${m.saved >= m.target ? 'Meta alcançada' : `Faltam ${money(m.target - m.saved)}`}</strong></div><button class="btn secondary full" data-action="open" data-kind="movement" data-goal="">${ic('plus', 16)} Registrar economia</button><div class="muted-note">A meta é um planejamento, não uma despesa. Transferências entre cofrinhos não contam como novos depósitos.</div>`)}</div>
  <div class="two-cols">${panel(`<div class="panel-title"><div><h3>Receitas x despesas</h3><p>Últimos 6 meses</p></div></div>${barChart(data, month)}`)}${panel(`<div class="panel-title"><div><h3>Alertas inteligentes</h3><p>Gerados a partir dos seus registros</p></div>${ic('bell')}</div><div class="alerts-list">${alertsHtml(warning)}</div>`)}</div>
- <div class="two-cols">${panel(`<div class="panel-title"><div><h3>Evolução do saldo</h3><p>Resultado de cada mês, sem acumular saldos</p></div></div>${lineChart(data, month, 'balance')}`)}${panel(`<div class="panel-title"><div><h3>Contas pendentes</h3><p>Despesas fixas do mês selecionado</p></div><button class="text-button" data-action="navigate" data-page="fixas">Ver todas ${ic('chevron', 14)}</button></div>${up.length ? up.map(f => `<div class="item-slim"><div class="item-icon">${ic('calendar-clock')}</div><div><strong>${escapeHtml(f.description)}</strong><small>Vence dia ${f.dueDay}</small></div><b>${money(f.amount)}</b></div>`).join('') : emptyState('Tudo em dia', 'Nenhuma conta fixa pendente neste mês.')}`)}</div>${panel(`<div class="panel-title"><div><h3>Histórico de economia mensal</h3><p>Depósitos líquidos dos últimos 12 meses</p></div></div>${lineChart(data, month, 'saved')}`)}`;
+ <div class="two-cols">${panel(`<div class="panel-title"><div><h3>Evolução do saldo</h3><p>Resultado de cada mês, sem acumular saldos</p></div></div>${lineChart(data, month, 'balance')}`)}${panel(`<div class="panel-title"><div><h3>Contas pendentes</h3><p>Contas e parcelas do mês selecionado</p></div><button class="text-button" data-action="navigate" data-page="fixas">Ver todas ${ic('chevron', 14)}</button></div>${up.length ? up.map(f => `<div class="item-slim"><div class="item-icon">${ic('calendar-clock')}</div><div><strong>${escapeHtml(f.description)}</strong><small>Vence dia ${f.dueDay}</small></div><b>${money(f.amount)}</b></div>`).join('') : emptyState('Tudo em dia', 'Nenhuma conta fixa pendente neste mês.')}`)}</div>${panel(`<div class="panel-title"><div><h3>Histórico de economia mensal</h3><p>Depósitos líquidos dos últimos 12 meses</p></div></div>${lineChart(data, month, 'saved')}`)}`;
 }
 function actionBar(kind, label) { return `<button class="btn primary" data-action="open" data-kind="${kind}">${ic('plus', 17)} ${label}</button>`; }
 function incomeView() { const list = selectedIncomes(data, month), m = calc(data, month); return `${title('Minhas Receitas', 'Salários, trabalhos e outras fontes de renda.', actionBar('income', 'Nova receita'))}<div class="small-stats">${kpi('wallet', 'Receitas do mês', m.income, 'Registradas', 'blue')}${kpi('repeat', 'Receitas recorrentes', sum(list.filter(x => x.recurring), x => x.amount), 'Incluídas no mês', 'teal')}${kpi('coins', 'Receitas pontuais', sum(list.filter(x => !x.recurring), x => x.amount), 'Incluídas no mês', 'orange')}</div>${panel(list.length ? `<div class="table-scroll"><table><thead><tr><th>Descrição</th><th>Tipo</th><th>Recebimento</th><th>Valor</th><th>Ações</th></tr></thead><tbody>${list.map(x => `<tr><td><strong>${escapeHtml(x.description)}</strong><small>${escapeHtml(x.kind)}</small></td><td>${pill(x.recurring ? 'Recorrente' : 'Pontual', x.recurring ? 'info' : 'muted')}</td><td>${x.recurring ? `Todo dia ${Number(x.date.slice(8))}` : displayDate(x.date)}</td><td class="money-cell">${money(x.amount)}</td><td class="actions">${smallAction('edit', 'income', x.id)}${smallAction('delete', 'income', x.id)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('Nenhuma receita neste mês', 'Cadastre seu salário ou outra fonte de renda.', actionBar('income', 'Adicionar receita')))}`; }
 function smallAction(a, kind, id) { return `<button class="icon-btn" aria-label="${a === 'edit' ? 'Editar' : 'Excluir'}" title="${a === 'edit' ? 'Editar' : 'Excluir'}" data-action="${a}" data-kind="${kind}" data-id="${escapeHtml(id)}">${ic(a === 'edit' ? 'edit' : 'trash', 16)}</button>`; }
 function displayDate(date) { if (!date)
     return '—'; const [y, m, d] = date.split('-'); return `${d}/${m}/${y}`; }
-function fixedView() { const list = selectedFixed(data, month), v = calc(data, month); const paid = list.filter(x => x.paidMonths.includes(month)); return `${title('Despesas Fixas', 'Contas que se repetem automaticamente a cada mês.', actionBar('fixed', 'Nova despesa fixa'))}<div class="small-stats">${kpi('calendar-clock', 'Total comprometido', v.fixed, 'Todas as contas', 'violet')}${kpi('check', 'Total pago', sum(paid, x => x.amount), `${paid.length} conta(s) paga(s)`, 'green')}${kpi('bell', 'Total pendente', sum(list.filter(x => !x.paidMonths.includes(month)), x => x.amount), 'A vencer / em aberto', 'orange')}</div>${panel(list.length ? `<div class="table-scroll"><table><thead><tr><th>Conta / categoria</th><th>Vencimento</th><th>Status</th><th>Valor</th><th>Ações</th></tr></thead><tbody>${list.map(x => `<tr><td><strong>${escapeHtml(x.description)}</strong><small>${escapeHtml(x.category)}</small></td><td>Dia ${x.dueDay}</td><td><button class="status-toggle ${x.paidMonths.includes(month) ? 'paid' : 'pending'}" data-action="paid" data-id="${escapeHtml(x.id)}">${ic(x.paidMonths.includes(month) ? 'check' : 'bell', 14)} ${x.paidMonths.includes(month) ? 'Paga' : 'Pendente'}</button></td><td class="money-cell">${money(x.amount)}</td><td class="actions">${smallAction('edit', 'fixed', x.id)}${smallAction('delete', 'fixed', x.id)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('Nenhuma conta fixa', 'As contas cadastradas se repetirão nos próximos meses.', actionBar('fixed', 'Cadastrar conta')))}<p class="inside-tip">${ic('info', 16)} Alterar ou excluir uma conta recorrente afeta apenas o mês selecionado e os próximos meses da mesma versão. O histórico permanece preservado.</p>`; }
+function fixedView() { const list = selectedFixed(data, month), v = calc(data, month); const paid = list.filter(x => x.paidMonths.includes(month)), parcels = selectedInstallments(data, month), paidParcels = parcels.filter(x => x.part.paid); return `${title('Despesas Fixas', 'Contas recorrentes. Parcelamentos ficam na seção específica.', `${actionBar('fixed', 'Nova despesa fixa')}<button class="btn secondary" data-action="navigate" data-page="parcelamentos">${ic('layers', 16)} Parcelamentos</button>`)}<div class="small-stats">${kpi('calendar-clock', 'Total comprometido', v.fixed, 'Fixas e parcelamentos', 'violet')}${kpi('check', 'Total pago', sum(paid, x => x.amount) + sum(paidParcels, x => x.part.amount), `${paid.length + paidParcels.length} pagamento(s)`, 'green')}${kpi('bell', 'Total pendente', sum(list.filter(x => !x.paidMonths.includes(month)), x => x.amount) + sum(parcels.filter(x => !x.part.paid), x => x.part.amount), 'A vencer / em aberto', 'orange')}</div>${panel(list.length ? `<div class="table-scroll"><table><thead><tr><th>Conta / categoria</th><th>Vencimento</th><th>Status</th><th>Valor</th><th>Ações</th></tr></thead><tbody>${list.map(x => `<tr><td><strong>${escapeHtml(x.description)}</strong><small>${escapeHtml(x.category)}</small></td><td>Dia ${x.dueDay}</td><td><button class="status-toggle ${x.paidMonths.includes(month) ? 'paid' : 'pending'}" data-action="paid" data-id="${escapeHtml(x.id)}">${ic(x.paidMonths.includes(month) ? 'check' : 'bell', 14)} ${x.paidMonths.includes(month) ? 'Paga' : 'Pendente'}</button></td><td class="money-cell">${money(x.amount)}</td><td class="actions">${smallAction('edit', 'fixed', x.id)}${smallAction('delete', 'fixed', x.id)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('Nenhuma conta fixa', 'As contas cadastradas se repetirão nos próximos meses.', actionBar('fixed', 'Cadastrar conta')))}<p class="inside-tip">${ic('info', 16)} Alterar ou excluir uma conta recorrente afeta apenas o mês selecionado e os próximos meses da mesma versão. O histórico permanece preservado.</p>`; }
 function filteredExpenses() { const end = month; let start = end; if (filters.period === 'quarter')
     start = addMonth(end, -2); if (filters.period === 'year')
     start = addMonth(end, -11); return data.expenses.filter(x => (filters.period === 'all' || (monthOf(x.date) >= start && monthOf(x.date) <= end)) && (!filters.category || x.category === filters.category) && (!filters.search || x.description.toLowerCase().includes(filters.search.toLowerCase())) && (!filters.min || x.amount >= amountToCents(filters.min)) && (!filters.max || x.amount <= amountToCents(filters.max))).sort((a, b) => b.date.localeCompare(a.date)); }
+function installmentView() {
+    const plans = data.installments || [], entries = selectedInstallments(data, month);
+    const total = sum(entries, x => x.part.amount), paid = sum(entries.filter(x => x.part.paid), x => x.part.amount);
+    const shown = plans.filter(p => p.installments.some(i => i.month === month));
+    return `${title('Parcelamentos e Financiamentos', 'Compras em parcelas com início e fim, sem cobranças eternas.', actionBar('installment', 'Novo parcelamento'))}
+ <div class="small-stats">${kpi('layers', 'Parcelas do mês', total, `${entries.length} parcela(s) neste mês`, 'violet')}${kpi('check', 'Parcelas pagas', paid, 'Pagamentos confirmados', 'green')}${kpi('bell', 'Parcelas pendentes', total - paid, 'Ainda não pagas', 'orange')}</div>
+ ${panel(shown.length ? `<div class="installment-list">${shown.map(plan => {
+        const monthly = plan.installments.filter(p => p.month === month);
+        const all = plan.installments.filter(p => !p.kind || p.kind === 'payoff');
+        const count = all.length, paidCount = all.filter(p => p.paid).length;
+        const remaining = sum(all.filter(p => !p.paid), p => p.amount);
+        const end = all[all.length - 1]?.month || month;
+        const editable = plan.installments.some(p => p.month >= month && !p.paid);
+        return `<div class="installment-card"><div class="installment-head"><div class="installment-symbol">${ic('layers', 22)}</div><div class="installment-main"><strong>${escapeHtml(monthly[0]?.description || plan.description)}</strong><small>${escapeHtml(monthly[0]?.category || plan.category)} • Última parcela: ${monthLabel(end)}</small></div><div class="installment-price">${money(sum(monthly, x => x.amount))}<small>${paidCount} de ${count} pagamentos</small></div></div>
+ <div class="installment-progress">${progress(paidCount, count)}<div><span>Restante previsto: ${money(remaining)}</span><span>Comprometido: ${money(installmentTotal(plan))}</span></div></div>
+ <div class="installment-payments">${monthly.map(p => { const nth = plan.installments.indexOf(p) + 1; return `<div class="installment-payment"><div><strong>${p.kind === 'payoff' ? 'Quitação antecipada' : `Parcela ${nth}/${count}`}</strong><small>Vence ${displayDate(dueDateFor(p.month, p.dueDay))} • ${money(p.amount)}</small></div><button class="status-toggle ${p.paid ? 'paid' : 'pending'}" data-action="installment-paid" data-id="${escapeHtml(plan.id)}" data-part="${escapeHtml(p.id)}" ${p.kind === 'payoff' ? 'disabled title="Quitação registrada"' : ''}>${ic(p.paid ? 'check' : 'bell', 14)} ${p.paid ? 'Paga' : 'Pendente'}</button></div>`; }).join('')}</div>
+ <div class="installment-actions"><button class="btn secondary" data-action="edit" data-kind="installment" data-id="${escapeHtml(plan.id)}" ${!editable ? 'disabled title="Não há parcelas futuras não pagas para editar"' : ''}>${ic('edit', 15)} Editar futuras</button><button class="btn ghost" data-action="installment-settle" data-id="${escapeHtml(plan.id)}" ${month < currentMonth() || !editable ? 'disabled' : ''}>${ic('check', 15)} Quitar antecipadamente</button><button class="btn danger" data-action="delete" data-kind="installment" data-id="${escapeHtml(plan.id)}" ${plan.installments.some(p => p.month >= month && p.paid) ? 'disabled title="Desmarque pagamentos deste mês ou futuros para remover"' : ''}>${ic('trash', 15)} Excluir futuras</button></div></div>`;
+    }).join('')}</div>` : emptyState('Sem parcelas neste mês', 'Cadastre uma compra parcelada ou navegue para o mês da primeira parcela.', actionBar('installment', 'Cadastrar parcelamento')))}
+ <p class="inside-tip">${ic('info', 16)} Os valores são incluídos automaticamente nas despesas fixas, no saldo, nos gráficos e nos relatórios. Cada parcela é gerada uma única vez. Editar ou excluir altera só parcelas do mês selecionado em diante; meses anteriores ficam preservados.</p>`;
+}
 function expenseView() { const list = filteredExpenses(), total = sum(list, x => x.amount), catMap = new Map(); for (const x of list)
     catMap.set(x.category, (catMap.get(x.category) || 0) + x.amount); const cat = Array.from(catMap, ([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value); return `${title('Meus Gastos', 'Registre e filtre suas despesas do dia a dia.', actionBar('expense', 'Novo gasto'))}<div class="filterbar"><label>Período<select data-filter="period"><option value="month" ${filters.period === 'month' ? 'selected' : ''}>Mês selecionado</option><option value="quarter" ${filters.period === 'quarter' ? 'selected' : ''}>Últimos 3 meses</option><option value="year" ${filters.period === 'year' ? 'selected' : ''}>Últimos 12 meses</option><option value="all" ${filters.period === 'all' ? 'selected' : ''}>Todos os registros</option></select></label><label>Categoria<select data-filter="category"><option value="">Todas</option>${CATEGORIES.map(c => `<option ${filters.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select></label><label>Mínimo (R$)<input type="number" min="0" step="0.01" placeholder="0,00" value="${escapeHtml(filters.min)}" data-filter="min"></label><label>Máximo (R$)<input type="number" min="0" step="0.01" placeholder="Sem limite" value="${escapeHtml(filters.max)}" data-filter="max"></label><label class="search-filter">Buscar<input placeholder="Descrição..." value="${escapeHtml(filters.search)}" data-filter="search"></label><button class="btn ghost filter-clear" data-action="clear-filter">Limpar</button></div><div class="small-stats stats-two">${kpi('credit-card', 'Gasto filtrado', total, `${list.length} lançamento(s)`, 'orange')}${kpi('chart-no-axes-combined', 'Maior categoria', cat.length ? cat[0].value : 0, cat.length ? cat[0].name : 'Sem gastos', 'blue')}</div><div class="two-cols wide-left">${panel(`<div class="panel-title"><div><h3>Lançamentos</h3><p>${list.length} resultado(s)</p></div></div>${list.length ? `<div class="table-scroll"><table><thead><tr><th>Descrição</th><th>Data</th><th>Valor</th><th>Ações</th></tr></thead><tbody>${list.map(x => `<tr><td><strong>${escapeHtml(x.description)}</strong><small>${escapeHtml(x.category)}</small></td><td>${displayDate(x.date)}</td><td class="money-cell">${money(x.amount)}</td><td class="actions">${smallAction('edit', 'expense', x.id)}${smallAction('delete', 'expense', x.id)}</td></tr>`).join('')}</tbody></table></div>` : emptyState('Nenhum gasto encontrado', 'Registre despesas ou ajuste os filtros.')}`)}${panel(`<div class="panel-title"><div><h3>Por categoria</h3><p>De acordo com o filtro aplicado</p></div></div>${donut(cat)}`)}</div>`; }
 function economyView() {
@@ -684,6 +774,7 @@ function pageContent() { switch (page) {
     case 'dashboard': return dashboard();
     case 'receitas': return incomeView();
     case 'fixas': return fixedView();
+    case 'parcelamentos': return installmentView();
     case 'gastos': return expenseView();
     case 'economia': return economyView();
     case 'metas': return goalsView();
@@ -713,6 +804,22 @@ function modalContent() {
         head = edit ? 'Editar despesa fixa' : 'Cadastrar despesa fixa';
         help = 'Os lançamentos são gerados automaticamente na visualização de cada mês, sem duplicar registros.';
         body = `<div class="form-grid">${input('description', 'Nome da conta', 'text', x?.description || '', 'required maxlength="160" placeholder="Ex.: Internet"')}${input('amount', 'Valor mensal (R$)', 'number', x ? x.amount / 100 : '', 'required min="0.01" step="0.01"')}${categoryOptions(x?.category || 'Contas')}${input('dueDay', 'Dia do vencimento', 'number', x?.dueDay || 10, 'required min="1" max="31" step="1"')}</div><p class="modal-help">Se o dia não existir em determinado mês, o vencimento será considerado no último dia desse mês. ${edit ? 'Histórico anterior permanece intacto.' : ''}</p>`;
+    }
+    else if (type === 'installment') {
+        const plan = (data.installments || []).find(v => v.id === id);
+        const upcoming = plan?.installments.filter(p => p.month >= month) || [];
+        head = edit ? 'Editar parcelas futuras' : 'Novo parcelamento';
+        help = edit ? 'Parcelas anteriores não mudam. Os meses a partir do selecionado serão recalculados.' : 'Informe valor total, número de parcelas e primeiro vencimento.';
+        if (edit && (!upcoming.length || upcoming.some(p => p.paid))) {
+            body = '<p class="modal-help">Há parcelas futuras pagas ou não há parcelas para alterar. Desmarque pagamentos futuros antes de editar.</p>';
+        }
+        else {
+            const desc = upcoming[0]?.description || plan?.description || '';
+            const category = upcoming[0]?.category || plan?.category || 'Compras';
+            const due = upcoming[0]?.dueDay || plan?.dueDay || 10;
+            const amount = edit ? sum(upcoming, p => p.amount) : 0;
+            body = `<div class="form-grid">${input('description', 'O que foi comprado?', 'text', desc, 'required maxlength="160" placeholder="Ex.: Máquina de lavar"')}${categoryOptions(category)}${input('amount', 'Valor total das parcelas (R$)', 'number', edit ? amount / 100 : '', 'required min="0.01" step="0.01"')}${input('count', 'Quantidade de parcelas', 'number', edit ? upcoming.length : 10, 'required min="1" max="360" step="1"')}${input('firstMonth', edit ? 'Alterar a partir do mês' : 'Mês da primeira parcela', 'month', edit ? month : month, edit ? 'readonly' : 'required')}${input('dueDay', 'Dia de vencimento', 'number', due, 'required min="1" max="31"')}</div><p class="modal-help">As parcelas serão distribuídas em centavos exatos, inclusive quando o valor não divide igualmente. Os pagamentos não são lançados outra vez como gastos. ${edit ? 'Somente parcelas ainda não pagas, deste mês em diante, serão substituídas.' : ''}</p>`;
+        }
     }
     else if (type === 'expense') {
         const x = data.expenses.find(v => v.id === id);
@@ -757,7 +864,7 @@ function applyTheme(t) { if (!['light', 'dark', 'system'].includes(t))
     localStorage.setItem('financeflow-theme', t);
 }
 catch { } document.documentElement.setAttribute('data-theme', t); }
-function mainShell() { const selected = navItems.find(v => v[0] === page); return `<div class="app-layout"><div class="mobile-overlay ${sidebarOpen ? 'visible' : ''}" data-action="close-sidebar"></div><aside class="sidebar ${sidebarOpen ? 'open' : ''}"><div class="brand"><div class="brand-mark">${ic('chart-no-axes-combined', 22)}</div><strong>Finance<span>Flow</span></strong><button class="icon-btn sidebar-close" data-action="close-sidebar" aria-label="Fechar menu">${ic('close')}</button></div><div class="sidebar-caption">MENU PRINCIPAL</div><nav class="side-nav">${navItems.map(([key, label, icon]) => `<button class="side-item ${page === key ? 'selected' : ''}" data-action="navigate" data-page="${key}">${ic(icon, 19)}<span>${label}</span>${page === key ? '<i></i>' : ''}</button>`).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-private">${ic('shield', 20)}<div><strong>Conta protegida</strong><small>${escapeHtml(cloudSession?.user.email || 'Sua conta')}</small></div></div><small>FinanceFlow • Cloud 1.0</small></div></aside><main class="main"><header class="topbar"><div class="topbar-left"><button class="icon-btn mobile-menu" data-action="open-sidebar" aria-label="Abrir menu">${ic('menu', 21)}</button><div><div class="breadcrumb">FinanceFlow <span> / </span> ${escapeHtml(selected?.[1] || '')}</div><h1>${escapeHtml(selected?.[1] || 'Visão geral')}</h1></div></div><div class="topbar-right">${cloudStatusHTML()}<div class="month-switch"><button class="month-btn" data-action="prev-month" aria-label="Mês anterior">${ic('chevronleft', 17)}</button><strong>${monthLabel(month)}</strong><button class="month-btn" data-action="next-month" aria-label="Próximo mês">${ic('chevron', 17)}</button></div>${month !== currentMonth() ? `<button class="btn today" data-action="today">Hoje</button>` : ''}<button class="icon-btn top-theme" data-action="toggle-theme" aria-label="Alternar tema">${ic('moon', 20)}</button></div></header><div class="page-body">${pageContent()}<footer class="page-footer">FinanceFlow Cloud • Dados sincronizados com sua conta • ${monthLabel(month)}</footer></div></main><nav class="mobile-bottom" aria-label="Navegação rápida">${[['dashboard', 'Início', 'layout-dashboard'], ['gastos', 'Gastos', 'credit-card'], ['fixas', 'Fixas', 'calendar-clock'], ['economia', 'Economia', 'piggy-bank']].map(([k, l, i]) => `<button class="${page === k ? 'selected' : ''}" data-action="navigate" data-page="${k}">${ic(i, 22)}<span>${l}</span></button>`).join('')}<button data-action="open-sidebar">${ic('menu', 22)}<span>Mais</span></button></nav></div>`; }
+function mainShell() { const selected = navItems.find(v => v[0] === page); return `<div class="app-layout"><div class="mobile-overlay ${sidebarOpen ? 'visible' : ''}" data-action="close-sidebar"></div><aside class="sidebar ${sidebarOpen ? 'open' : ''}"><div class="brand"><div class="brand-mark">${ic('chart-no-axes-combined', 22)}</div><strong>Finance<span>Flow</span></strong><button class="icon-btn sidebar-close" data-action="close-sidebar" aria-label="Fechar menu">${ic('close')}</button></div><div class="sidebar-caption">MENU PRINCIPAL</div><nav class="side-nav">${navItems.map(([key, label, icon]) => `<button class="side-item ${page === key ? 'selected' : ''}" data-action="navigate" data-page="${key}">${ic(icon, 19)}<span>${label}</span>${page === key ? '<i></i>' : ''}</button>`).join('')}</nav><div class="sidebar-bottom"><div class="sidebar-private">${ic('shield', 20)}<div><strong>Conta protegida</strong><small>${escapeHtml(cloudSession?.user.email || 'Sua conta')}</small></div></div><small>FinanceFlow • Cloud 1.1</small></div></aside><main class="main"><header class="topbar"><div class="topbar-left"><button class="icon-btn mobile-menu" data-action="open-sidebar" aria-label="Abrir menu">${ic('menu', 21)}</button><div><div class="breadcrumb">FinanceFlow <span> / </span> ${escapeHtml(selected?.[1] || '')}</div><h1>${escapeHtml(selected?.[1] || 'Visão geral')}</h1></div></div><div class="topbar-right">${cloudStatusHTML()}<div class="month-switch"><button class="month-btn" data-action="prev-month" aria-label="Mês anterior">${ic('chevronleft', 17)}</button><strong>${monthLabel(month)}</strong><button class="month-btn" data-action="next-month" aria-label="Próximo mês">${ic('chevron', 17)}</button></div>${month !== currentMonth() ? `<button class="btn today" data-action="today">Hoje</button>` : ''}<button class="icon-btn top-theme" data-action="toggle-theme" aria-label="Alternar tema">${ic('moon', 20)}</button></div></header><div class="page-body">${pageContent()}<footer class="page-footer">FinanceFlow Cloud • Dados sincronizados com sua conta • ${monthLabel(month)}</footer></div></main><nav class="mobile-bottom" aria-label="Navegação rápida">${[['dashboard', 'Início', 'layout-dashboard'], ['gastos', 'Gastos', 'credit-card'], ['fixas', 'Fixas', 'calendar-clock'], ['economia', 'Economia', 'piggy-bank']].map(([k, l, i]) => `<button class="${page === k ? 'selected' : ''}" data-action="navigate" data-page="${k}">${ic(i, 22)}<span>${l}</span></button>`).join('')}<button data-action="open-sidebar">${ic('menu', 22)}<span>Mais</span></button></nav></div>`; }
 function render() { const app = document.getElementById('app'); if (!app)
     return; app.innerHTML = cloudState !== 'ready' ? cloudAuthHTML() : data.setup ? mainShell() + modalContent() : onboarding(); if (notice) {
     const n = document.createElement('div');
@@ -866,6 +973,41 @@ async function saveEntity(form) {
             else
                 data.fixed.push({ id: uid(), seriesId: uid(), description, amount, category, dueDay, startMonth: month, paidMonths: [] });
         }
+        else if (kind === 'installment') {
+            const description = formString(f, 'description');
+            if (!description || description.length > 160)
+                throw new Error('Informe uma descrição de até 160 caracteres.');
+            const amount = ensureAmount(formString(f, 'amount'));
+            const category = formString(f, 'category');
+            if (!category || category.length > 160)
+                throw new Error('Categoria inválida.');
+            const count = Number(formString(f, 'count')), dueDay = Number(formString(f, 'dueDay'));
+            if (!Number.isInteger(count) || count < 1 || count > 360)
+                throw new Error('Número de parcelas deve ser de 1 a 360.');
+            if (!Number.isInteger(dueDay) || dueDay < 1 || dueDay > 31)
+                throw new Error('O vencimento deve estar entre 1 e 31.');
+            const firstMonth = formString(f, 'firstMonth');
+            if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(firstMonth))
+                throw new Error('Selecione o mês inicial.');
+            const plan = (data.installments || []).find(p => p.id === id);
+            if (plan) {
+                if (firstMonth !== month)
+                    throw new Error('Alterações precisam começar no mês selecionado.');
+                const future = plan.installments.filter(p => p.month >= month);
+                if (!future.length || future.some(p => p.paid))
+                    throw new Error('Desmarque pagamentos futuros antes de alterar o parcelamento.');
+                plan.installments = [...plan.installments.filter(p => p.month < month), ...newInstallmentParts(amount, count, month, description, category, dueDay)];
+                plan.description = description;
+                plan.category = category;
+                plan.dueDay = dueDay;
+            }
+            else {
+                const installments = newInstallmentParts(amount, count, firstMonth, description, category, dueDay);
+                if (!data.installments)
+                    data.installments = [];
+                data.installments.push({ id: uid(), description, category, dueDay, installments });
+            }
+        }
         else if (kind === 'expense') {
             const description = formString(f, 'description');
             if (!description)
@@ -943,6 +1085,8 @@ async function deletion(kind, id) {
         name = data.fixed.find(x => x.id === id)?.description || name;
     if (kind === 'expense')
         name = data.expenses.find(x => x.id === id)?.description || name;
+    if (kind === 'installment')
+        name = (data.installments || []).find(p => p.id === id)?.description || name;
     if (kind === 'movement')
         name = 'esta movimentação';
     if (!confirm(`Confirma a exclusão de "${name}"? ${kind === 'fixed' || kind === 'income' ? 'Para registros recorrentes, os meses anteriores continuarão preservados.' : 'Esta ação não pode ser desfeita sem um backup.'}`))
@@ -963,6 +1107,18 @@ async function deletion(kind, id) {
                 x.endMonth = addMonth(month, -1);
             else
                 data.fixed = data.fixed.filter(r => r.id !== id);
+        }
+    }
+    if (kind === 'installment') {
+        const plan = (data.installments || []).find(p => p.id === id);
+        if (plan) {
+            if (plan.installments.some(p => p.month >= month && p.paid)) {
+                flash('Desmarque os pagamentos deste mês e dos futuros antes de excluir.', 'error');
+                return;
+            }
+            plan.installments = plan.installments.filter(p => p.month < month);
+            if (!plan.installments.length)
+                data.installments = (data.installments || []).filter(p => p.id !== id);
         }
     }
     if (kind === 'expense')
@@ -1003,6 +1159,8 @@ function exportCSV() {
         items.push({ date: i.recurring ? `${month}-${String(Math.min(Number(i.date.slice(8)), new Date(Number(month.slice(0, 4)), Number(month.slice(5)), 0).getDate())).padStart(2, '0')}` : i.date, type: 'Receita', description: i.description, category: i.kind, amount: i.amount, extra: i.recurring ? 'Recorrente' : 'Pontual' });
     for (const x of selectedFixed(data, month))
         items.push({ date: `${month}-${String(Math.min(x.dueDay, new Date(Number(month.slice(0, 4)), Number(month.slice(5)), 0).getDate())).padStart(2, '0')}`, type: 'Despesa fixa', description: x.description, category: x.category, amount: -x.amount, extra: x.paidMonths.includes(month) ? 'Paga' : 'Pendente' });
+    for (const { part } of selectedInstallments(data, month))
+        items.push({ date: dueDateFor(part.month, part.dueDay), type: 'Parcela', description: part.description, category: part.category, amount: -part.amount, extra: `${part.kind === 'payoff' ? 'Quitação antecipada / ' : ''}${part.paid ? 'Paga' : 'Pendente'}` });
     for (const x of selectedExpenses(data, month))
         items.push({ date: x.date, type: 'Gasto variável', description: x.description, category: x.category, amount: -x.amount, extra: '' });
     for (const x of selectedMovements(data, month))
@@ -1226,6 +1384,38 @@ function bindEvents() {
         }
         if (a === 'archive') {
             void archiveGoal(id);
+            return;
+        }
+        if (a === 'installment-paid') {
+            const plan = (data.installments || []).find(p => p.id === id), part = plan?.installments.find(x => x.id === b.dataset.part);
+            if (part && part.kind !== 'payoff') {
+                part.paid = !part.paid;
+                if (part.paid)
+                    part.paidAt = isoLocal(now());
+                else
+                    delete part.paidAt;
+                void save('Status da parcela atualizado.');
+            }
+            return;
+        }
+        if (a === 'installment-settle') {
+            const plan = (data.installments || []).find(p => p.id === id);
+            if (!plan)
+                return;
+            const remaining = sum(plan.installments.filter(p => p.month >= month && !p.paid), p => p.amount);
+            if (!remaining) {
+                flash('Não há parcelas pendentes para quitar.', 'error');
+                return;
+            }
+            if (!confirm(`Quitar antecipadamente "${plan.description}" por ${money(remaining)} em ${monthLabel(month)}? As parcelas futuras não pagas serão encerradas. Isso registra o pagamento total, sem criar uma despesa extra.`))
+                return;
+            try {
+                const total = settleInstallment(data, id, month);
+                void save(`Parcelamento quitado: ${money(total)}.`);
+            }
+            catch (e) {
+                flash(e.message, 'error');
+            }
             return;
         }
         if (a === 'paid') {
